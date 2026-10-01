@@ -82,6 +82,7 @@ class Broker:
         from alpaca.trading.client import TradingClient
         from alpaca.data.historical import StockHistoricalDataClient
         self.trading = TradingClient(cfg.alpaca_key, cfg.alpaca_secret, paper=cfg.paper)
+        self.key, self.secret, self.paper = cfg.alpaca_key, cfg.alpaca_secret, cfg.paper
         self.data = StockHistoricalDataClient(cfg.alpaca_key, cfg.alpaca_secret)
 
     def market_open(self) -> bool:
@@ -144,6 +145,24 @@ class Broker:
         from alpaca.trading.enums import QueryOrderStatus
         return len(self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)))
 
+    def net_deposits(self) -> float | None:
+        """Total money you've put in (deposits minus withdrawals), from Alpaca's activity log."""
+        base = "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
+        headers = {"APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret}
+        total, token = 0.0, None
+        for _ in range(50):  # up to 5,000 deposits/withdrawals
+            params = {"activity_types": "CSD,CSW", "direction": "asc", "page_size": 100}
+            if token:
+                params["page_token"] = token
+            r = requests.get(f"{base}/v2/account/activities", headers=headers, params=params, timeout=20)
+            r.raise_for_status()
+            page = r.json()
+            total += sum(float(a.get("net_amount") or 0) for a in page)
+            if len(page) < 100:
+                return total
+            token = page[-1]["id"]
+        return total
+
     def week_change(self) -> float | None:
         """Account % change over the last week from Alpaca's portfolio history."""
         from alpaca.trading.requests import GetPortfolioHistoryRequest
@@ -183,6 +202,11 @@ class RunResult:
     target: str
     actions: list[str] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+    error: bool = False
+
+
+def fund_name(symbol: str) -> str:
+    return {"SSO": "the 2x S&P fund (SSO)", "BIL": "safe T-bills (BIL)"}.get(symbol, symbol)
 
 
 def rebalance(broker, cfg: Config, now: datetime | None = None) -> RunResult:
@@ -192,13 +216,10 @@ def rebalance(broker, cfg: Config, now: datetime | None = None) -> RunResult:
     target = cfg.risk_symbol if up else cfg.safe_symbol
     other = cfg.safe_symbol if up else cfg.risk_symbol
     res = RunResult(uptrend=up, target=target)
-    pct_vs_sma = (last / sma - 1) * 100
-    mode = "PAPER" if cfg.paper else "LIVE"
-    tag = " (dry run)" if cfg.dry_run else ""
+    cushion = (last / sma - 1) * 100
 
     if broker.open_orders():
-        res.messages.append(f"⚠️ [{mode}] Orders from an earlier run are still pending. "
-                            "Skipping today so nothing gets doubled up.")
+        res.messages.append("⚠️ An earlier order is still going through. Skipping today.")
         return res
 
     # 1) Switch: sell everything not in the target.
@@ -207,15 +228,14 @@ def rebalance(broker, cfg: Config, now: datetime | None = None) -> RunResult:
     for sym, value in held.items():
         if sym != target and value > 0:
             if sym not in (cfg.risk_symbol, cfg.safe_symbol):
-                res.messages.append(f"⚠️ [{mode}] Found {sym} (${value:,.2f}) in the account. "
-                                    "The bot only manages its own two funds, so it left this alone.")
+                res.messages.append(f"⚠️ You have {sym} in this account. The bot leaves it alone.")
                 continue
             res.actions.append(f"SELL all {sym} (${value:,.2f})")
             if not cfg.dry_run:
                 status = broker.sell_all(sym)
                 if status != "filled":
-                    res.messages.append(f"❌ [{mode}] Sell of {sym} ended as '{status}'. "
-                                        "No buy placed today; will retry tomorrow.")
+                    res.error = True
+                    res.messages.append(f"❌ Sell didn't go through ({status}). Trying again tomorrow.")
                     return res
             switched = sym == other or switched
 
@@ -228,7 +248,8 @@ def rebalance(broker, cfg: Config, now: datetime | None = None) -> RunResult:
             if not cfg.dry_run:
                 status = broker.buy(target, notional=cash)
                 if status != "filled":
-                    res.messages.append(f"❌ [{mode}] Buy of {target} ended as '{status}'.")
+                    res.error = True
+                    res.messages.append(f"❌ Buy didn't go through ({status}). Trying again tomorrow.")
             bought = cash
         else:
             price = broker.last_price(target)
@@ -238,32 +259,60 @@ def rebalance(broker, cfg: Config, now: datetime | None = None) -> RunResult:
                 if not cfg.dry_run:
                     status = broker.buy(target, qty=qty)
                     if status != "filled":
-                        res.messages.append(f"❌ [{mode}] Buy of {target} ended as '{status}'.")
+                        res.error = True
+                        res.messages.append(f"❌ Buy didn't go through ({status}). Trying again tomorrow.")
                 bought = qty * price
             else:
-                res.messages.append(f"ℹ️ ${cash:,.2f} cash is waiting: {target} can't be bought "
-                                    f"in fractions and one share costs ${price:,.2f}.")
+                res.messages.append(f"ℹ️ ${cash:,.2f} is waiting. One share of {target} costs ${price:,.2f}.")
 
-    # 3) Messages
-    trend_word = "UP ✅" if up else "DOWN 🛑"
-    if switched:
-        res.messages.insert(0, f"🔁 [{mode}] SWITCHED to {target}{tag}\n"
-                               f"S&P trend is {trend_word}: {cfg.signal_symbol} {last:,.2f} vs "
-                               f"200-day avg {sma:,.2f} ({pct_vs_sma:+.1f}%)\n" + "\n".join(res.actions))
+    # 3) Plain-English summary
+    if switched and up:
+        res.messages.insert(0, "🔁 Market turned UP ✅\n"
+                               f"Your money moved back into {fund_name(target)}.")
+    elif switched:
+        res.messages.insert(0, "🔁 Market turned DOWN 🛑\n"
+                               f"Sold everything and moved to {fund_name(target)} to protect your money.\n"
+                               "It buys back in when the market turns up.")
     elif bought > 0:
-        res.messages.insert(0, f"💵 [{mode}] Invested ${bought:,.2f} of new cash into {target}{tag}")
+        res.messages.insert(0, f"💵 ${bought:,.2f} invested.")
 
     equity = broker.equity()
-    res.messages.append(f"📊 [{mode}] {now:%a %b %d}: holding {target}. Trend {trend_word} "
-                        f"({pct_vs_sma:+.1f}% vs 200-day avg). Account ${equity:,.2f}")
+    if up:
+        trend = "Market: UP ✅ You're invested."
+        gap = f"Cushion: {cushion:.1f}% (bot sells if this hits 0%)"
+    else:
+        trend = "Market: DOWN 🛑 Your money is parked in safe T-bills."
+        gap = f"Bot buys back in if the S&P rises about {-cushion:.1f}%"
+    lines = [f"📊 {now:%a, %b %-d}", trend, f"Account: ${equity:,.2f}"]
+    try:
+        put_in = broker.net_deposits()
+    except Exception as e:  # noqa: BLE001  (profit line is a nice-to-have; never block trading)
+        print(f"Could not load deposits: {e}")
+        put_in = None
+    if put_in and put_in > 0:
+        profit = equity - put_in
+        sign = "+" if profit >= 0 else "-"
+        lines.append(f"Profit: {sign}${abs(profit):,.2f} ({profit / put_in * 100:+.1f}%) "
+                     f"on ${put_in:,.2f} you put in")
+    lines.append(gap)
+    res.messages.append("\n".join(lines))
 
     if now.weekday() == 4:  # Friday weekly summary
         wk = broker.week_change()
         spy_wk = closes[-1] / closes[-6] - 1 if len(closes) >= 6 else None
         if wk is not None and spy_wk is not None:
-            res.messages.append(f"🗓 Last 5 trading days: account {wk * 100:+.2f}% vs S&P {spy_wk * 100:+.2f}% "
-                                "(new deposits show up as gains in the account number)")
+            res.messages.append(f"🗓 This week: you {wk * 100:+.1f}%, S&P {spy_wk * 100:+.1f}%\n"
+                                "(deposits count as gains)")
     return res
+
+
+def compose(res: RunResult, cfg: Config) -> str:
+    header = []
+    if cfg.paper:
+        header.append("🧪 PRACTICE (fake money)")
+    if cfg.dry_run:
+        header.append("🧪 TEST ONLY (nothing bought or sold)")
+    return "\n\n".join(header + res.messages)
 
 
 def main() -> int:
@@ -274,11 +323,11 @@ def main() -> int:
             print("Market closed today; nothing to do.")
             return 0
         res = rebalance(broker, cfg)
-        for m in res.messages:
-            notify(cfg, m)
-        return 1 if any(m.startswith("❌") for m in res.messages) else 0
+        notify(cfg, compose(res, cfg))
+        return 1 if res.error else 0
     except Exception as e:  # noqa: BLE001
-        notify(cfg, f"❌ Bot error: {e}\n\nIt will try again on its next run. Details are in the GitHub run log.")
+        notify(cfg, f"❌ Something went wrong. Trying again next weekday.\n"
+                    f"If this happens twice, send it to Claude.\n\nDetails: {e}")
         traceback.print_exc()
         return 1
 
