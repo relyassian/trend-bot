@@ -16,6 +16,10 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: read
+  actions: write   # only used by the keep-alive step at the bottom
+
 concurrency:
   group: trend-bot
   cancel-in-progress: false
@@ -68,3 +72,11 @@ jobs:
       - name: Mark today as done
         if: github.event_name == 'schedule' && steps.ran.outputs.cache-hit != 'true'
         run: echo "${{ steps.date.outputs.d }}" > .ran-today
+
+      # Public repos have their schedules switched off after 60 days without activity.
+      # Re-enabling the workflow on every scheduled run resets that timer.
+      - name: Keep schedule alive
+        if: github.event_name == 'schedule' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/bot.yml/enable" || true
