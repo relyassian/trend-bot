@@ -2,9 +2,12 @@ name: trend-bot
 
 on:
   schedule:
-    # Weekdays at 14:45 UTC = 10:45am ET in summer, 9:45am ET in winter (both during market hours).
-    # GitHub may start scheduled runs a few minutes late; that's fine for this strategy.
+    # GitHub sometimes skips or delays scheduled runs, so there are three tries each weekday,
+    # all during market hours (ET): ~10:45am, 12:15pm, 1:45pm in summer; one hour earlier in winter.
+    # Only the first successful one does anything; the others see it already ran and stop.
     - cron: "45 14 * * 1-5"
+    - cron: "15 16 * * 1-5"
+    - cron: "45 17 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -21,12 +24,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Today's date (New York)
+        id: date
+        run: echo "d=$(TZ=America/New_York date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Check if today's run already happened
+        id: ran
+        if: github.event_name == 'schedule'
+        uses: actions/cache@v4
+        with:
+          path: .ran-today
+          key: ran-${{ steps.date.outputs.d }}
+
+      - name: Already ran today
+        if: steps.ran.outputs.cache-hit == 'true'
+        run: echo "Today's run already happened. Nothing to do."
+
       - uses: actions/checkout@v4
+        if: steps.ran.outputs.cache-hit != 'true'
+
       - uses: actions/setup-python@v5
+        if: steps.ran.outputs.cache-hit != 'true'
         with:
           python-version: "3.12"
+
       - run: pip install -r requirements.txt
+        if: steps.ran.outputs.cache-hit != 'true'
+
       - name: Run bot
+        if: steps.ran.outputs.cache-hit != 'true'
         env:
           ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
@@ -35,3 +61,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: python bot.py
+
+      # Mark today as done only after a successful scheduled run. If the bot failed,
+      # nothing is saved, so the next scheduled try runs it again.
+      - name: Mark today as done
+        if: github.event_name == 'schedule' && steps.ran.outputs.cache-hit != 'true'
+        run: echo "${{ steps.date.outputs.d }}" > .ran-today
