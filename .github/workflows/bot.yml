@@ -2,12 +2,13 @@ name: trend-bot
 
 on:
   schedule:
-    # GitHub sometimes skips or delays scheduled runs, so there are three tries each weekday,
-    # all during market hours (ET): ~10:45am, 12:15pm, 1:45pm in summer; one hour earlier in winter.
+    # GitHub sometimes skips or delays scheduled runs, so there are four tries each weekday,
+    # all during market hours (ET): ~10:45am, 12:15pm, 1:45pm, 3:15pm in summer; one hour earlier in winter.
     # Only the first successful one does anything; the others see it already ran and stop.
     - cron: "45 14 * * 1-5"
     - cron: "15 16 * * 1-5"
     - cron: "45 17 * * 1-5"
+    - cron: "15 19 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:
