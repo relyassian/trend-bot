@@ -18,7 +18,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -145,11 +145,11 @@ class Broker:
         from alpaca.trading.enums import QueryOrderStatus
         return len(self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)))
 
-    def net_deposits(self) -> float | None:
-        """Total money you've put in (deposits minus withdrawals), from Alpaca's activity log."""
+    def deposit_history(self) -> list[tuple[date, float]]:
+        """Every deposit (+) and withdrawal (-) with its date, from Alpaca's activity log."""
         base = "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
         headers = {"APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret}
-        total, token = 0.0, None
+        out, token = [], None
         for _ in range(50):  # up to 5,000 deposits/withdrawals
             params = {"activity_types": "CSD,CSW", "direction": "asc", "page_size": 100}
             if token:
@@ -157,18 +157,26 @@ class Broker:
             r = requests.get(f"{base}/v2/account/activities", headers=headers, params=params, timeout=20)
             r.raise_for_status()
             page = r.json()
-            total += sum(float(a.get("net_amount") or 0) for a in page)
+            for a in page:
+                raw = a.get("date") or a.get("created_at") or ""
+                out.append((date.fromisoformat(raw[:10]), float(a.get("net_amount") or 0)))
             if len(page) < 100:
-                return total
+                break
             token = page[-1]["id"]
-        return total
+        return out
 
-    def week_change(self) -> float | None:
-        """Account % change over the last week from Alpaca's portfolio history."""
+    def equity_history(self) -> list[tuple[date, float]]:
+        """Account value at each daily close for the past year, from Alpaca's portfolio history."""
         from alpaca.trading.requests import GetPortfolioHistoryRequest
-        h = self.trading.get_portfolio_history(GetPortfolioHistoryRequest(period="1W", timeframe="1D"))
-        eq = [e for e in (h.equity or []) if e]
-        return (eq[-1] / eq[0] - 1) if len(eq) >= 2 else None
+        h = self.trading.get_portfolio_history(GetPortfolioHistoryRequest(period="1A", timeframe="1D"))
+        out = []
+        for ts, eq in zip(h.timestamp or [], h.equity or []):
+            if eq is None:
+                continue
+            dt = datetime.fromtimestamp(ts, ET)
+            day = dt.date() + timedelta(days=1) if dt.hour >= 12 else dt.date()  # tolerate UTC-midnight stamps
+            out.append((day, float(eq)))
+        return out
 
     def _wait(self, order_id, timeout=90) -> str:
         deadline = time.time() + timeout
@@ -285,25 +293,72 @@ def rebalance(broker, cfg: Config, now: datetime | None = None) -> RunResult:
         gap = f"Bot buys back in if the S&P rises about {-cushion:.1f}%"
     lines = [f"📊 {now:%a, %b %-d}", trend, f"Account: ${equity:,.2f}"]
     try:
-        put_in = broker.net_deposits()
-    except Exception as e:  # noqa: BLE001  (profit line is a nice-to-have; never block trading)
+        deposits = broker.deposit_history()
+    except Exception as e:  # noqa: BLE001  (money lines are nice-to-have; never block trading)
         print(f"Could not load deposits: {e}")
-        put_in = None
-    if put_in and put_in > 0:
-        profit = equity - put_in
-        sign = "+" if profit >= 0 else "-"
-        lines.append(f"Profit: {sign}${abs(profit):,.2f} ({profit / put_in * 100:+.1f}%) "
-                     f"on ${put_in:,.2f} you put in")
+        deposits = None
+    history = []
+    if deposits is not None:
+        try:
+            history = broker.equity_history()
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not load account history: {e}")
+    if deposits is not None:
+        lines += money_lines(equity, now.date(), history, deposits)
     lines.append(gap)
     res.messages.append("\n".join(lines))
-
-    if now.weekday() == 4:  # Friday weekly summary
-        wk = broker.week_change()
-        spy_wk = closes[-1] / closes[-6] - 1 if len(closes) >= 6 else None
-        if wk is not None and spy_wk is not None:
-            res.messages.append(f"🗓 This week: you {wk * 100:+.1f}%, S&P {spy_wk * 100:+.1f}%\n"
-                                "(deposits count as gains)")
     return res
+
+
+def _money(x: float) -> str:
+    return f"{'+' if x >= 0 else '-'}${abs(x):,.2f}"
+
+
+def _months_back(d: date, months: int) -> date:
+    y, m = divmod(d.year * 12 + d.month - 1 - months, 12)
+    m += 1
+    for day in (d.day, 30, 29, 28):
+        try:
+            return date(y, m, min(d.day, day))
+        except ValueError:
+            continue
+    return date(y, m, 28)
+
+
+def money_lines(equity: float, today: date, history: list[tuple[date, float]],
+                deposits: list[tuple[date, float]]) -> list[str]:
+    """Gains with your own deposits taken out, so only market moves count.
+    Each period is shown only once the account is old enough to have it."""
+    out = []
+    put_in = sum(a for _, a in deposits)
+    if put_in > 0:
+        total = equity - put_in
+        out.append(f"Total: {_money(total)} ({total / put_in * 100:+.1f}%) on ${put_in:,.2f} put in")
+
+    closes = sorted((d, e) for d, e in history if d < today and e > 0)
+    if not closes:
+        return out
+    first_day = closes[0][0]
+    periods = [
+        ("yesterday", None),
+        ("Past week", today - timedelta(days=7)),
+        ("Past month", _months_back(today, 1)),
+        ("Past year", _months_back(today, 12)),
+    ]
+    for label, start in periods:
+        if start is None:
+            d0, e0 = closes[-1]
+            label = "Since yesterday" if d0 == today - timedelta(days=1) else f"Since {d0:%A}"
+        else:
+            if start < first_day:
+                continue  # account isn't old enough for this period yet
+            d0, e0 = [c for c in closes if c[0] <= start][-1]
+        added = sum(a for d, a in deposits if d > d0)
+        gain = equity - e0 - added
+        base = e0 + added
+        pct = gain / base * 100 if base > 0 else 0.0
+        out.append(f"{label}: {_money(gain)} ({pct:+.1f}%)")
+    return out
 
 
 def compose(res: RunResult, cfg: Config) -> str:
