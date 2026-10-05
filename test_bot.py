@@ -4,7 +4,7 @@ from datetime import datetime
 import pytest
 from datetime import date
 
-from bot import Config, rebalance, trend_signal, compose, money_lines, ET
+from bot import Config, rebalance, trend_signal, compose, money_lines, bar_day, ET
 
 UP = [100.0] * 199 + [110.0]      # last close above 200-day avg
 DOWN = [100.0] * 199 + [90.0]     # last close below
@@ -220,3 +220,12 @@ def test_full_message_sample():
     text = compose(rebalance(b, cfg, datetime(2026, 10, 9, 10, 45, tzinfo=ET)), cfg)
     print("\n----- sample daily message -----\n" + text)
     assert "Since yesterday" in text and "Past week" in text
+
+
+def test_bar_day_maps_close_stamps_to_their_trading_day():
+    fri = D(2026, 10, 2)
+    for stamp in [datetime(2026, 10, 2, 16, 0, tzinfo=ET),   # Friday close
+                  datetime(2026, 10, 2, 20, 0, tzinfo=ET),   # UTC midnight Saturday
+                  datetime(2026, 10, 3, 0, 0, tzinfo=ET)]:   # midnight ET Saturday
+        assert bar_day(stamp.timestamp()) == fri
+    assert bar_day(datetime(2026, 10, 1, 20, 0, tzinfo=ET).timestamp()) == D(2026, 10, 1)

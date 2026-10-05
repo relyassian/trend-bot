@@ -169,14 +169,10 @@ class Broker:
         """Account value at each daily close for the past year, from Alpaca's portfolio history."""
         from alpaca.trading.requests import GetPortfolioHistoryRequest
         h = self.trading.get_portfolio_history(GetPortfolioHistoryRequest(period="1A", timeframe="1D"))
-        out = []
-        for ts, eq in zip(h.timestamp or [], h.equity or []):
-            if eq is None:
-                continue
-            dt = datetime.fromtimestamp(ts, ET)
-            day = dt.date() + timedelta(days=1) if dt.hour >= 12 else dt.date()  # tolerate UTC-midnight stamps
-            out.append((day, float(eq)))
-        return out
+        stamps = list(h.timestamp or [])
+        print("Portfolio history stamps (last 3):",
+              [datetime.fromtimestamp(t, ET).isoformat() for t in stamps[-3:]])
+        return [(bar_day(ts), float(eq)) for ts, eq in zip(stamps, h.equity or []) if eq is not None]
 
     def _wait(self, order_id, timeout=90) -> str:
         deadline = time.time() + timeout
@@ -308,6 +304,16 @@ def rebalance(broker, cfg: Config, now: datetime | None = None) -> RunResult:
     lines.append(gap)
     res.messages.append("\n".join(lines))
     return res
+
+
+def bar_day(ts: float) -> date:
+    """Trading day a daily portfolio-history bar belongs to. Alpaca stamps a day's bar at or
+    after that day's close (seen: Friday's bar arriving stamped late Friday / early Saturday),
+    so step back 12 hours, then back over any weekend."""
+    day = (datetime.fromtimestamp(ts, ET) - timedelta(hours=12)).date()
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
 
 
 def _money(x: float) -> str:
