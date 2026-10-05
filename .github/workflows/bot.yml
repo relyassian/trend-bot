@@ -33,31 +33,33 @@ jobs:
         id: date
         run: echo "d=$(TZ=America/New_York date +%F)" >> "$GITHUB_OUTPUT"
 
+      # Scheduled runs skip if today already ran. A real (non-dry) manual run always runs,
+      # and counts as today's run so the later scheduled tries don't repeat it.
       - name: Check if today's run already happened
         id: ran
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || inputs.dry_run == false
         uses: actions/cache@v4
         with:
           path: .ran-today
           key: ran-${{ steps.date.outputs.d }}
 
       - name: Already ran today
-        if: steps.ran.outputs.cache-hit == 'true'
+        if: github.event_name == 'schedule' && steps.ran.outputs.cache-hit == 'true'
         run: echo "Today's run already happened. Nothing to do."
 
       - uses: actions/checkout@v4
-        if: steps.ran.outputs.cache-hit != 'true'
+        if: github.event_name != 'schedule' || steps.ran.outputs.cache-hit != 'true'
 
       - uses: actions/setup-python@v5
-        if: steps.ran.outputs.cache-hit != 'true'
+        if: github.event_name != 'schedule' || steps.ran.outputs.cache-hit != 'true'
         with:
           python-version: "3.12"
 
       - run: pip install -r requirements.txt
-        if: steps.ran.outputs.cache-hit != 'true'
+        if: github.event_name != 'schedule' || steps.ran.outputs.cache-hit != 'true'
 
       - name: Run bot
-        if: steps.ran.outputs.cache-hit != 'true'
+        if: github.event_name != 'schedule' || steps.ran.outputs.cache-hit != 'true'
         env:
           ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
@@ -70,7 +72,7 @@ jobs:
       # Mark today as done only after a successful scheduled run. If the bot failed,
       # nothing is saved, so the next scheduled try runs it again.
       - name: Mark today as done
-        if: github.event_name == 'schedule' && steps.ran.outputs.cache-hit != 'true'
+        if: (github.event_name == 'schedule' || inputs.dry_run == false) && steps.ran.outputs.cache-hit != 'true'
         run: echo "${{ steps.date.outputs.d }}" > .ran-today
 
       # Public repos have their schedules switched off after 60 days without activity.
