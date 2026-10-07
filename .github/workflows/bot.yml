@@ -2,9 +2,9 @@ name: trend-bot
 
 on:
   schedule:
-    # GitHub sometimes skips or delays scheduled runs, so there are four tries each weekday,
-    # all during market hours (ET): ~10:45am, 12:15pm, 1:45pm, 3:15pm in summer; one hour earlier in winter.
-    # Only the first successful one does anything; the others see it already ran and stop.
+    # GitHub often delays these by hours, so the main trigger is an outside daily check that
+    # starts this workflow at 10:50am ET (backup 2:50pm). These timers are extra tries.
+    # Only the first successful run each day does anything; the others see it already ran and stop.
     - cron: "45 14 * * 1-5"
     - cron: "15 16 * * 1-5"
     - cron: "45 17 * * 1-5"
@@ -15,6 +15,10 @@ on:
         description: "Dry run (show what it would do, place no orders)"
         type: boolean
         default: true
+      skip_if_done:
+        description: "Do nothing if today's run already happened (used by the daily check)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,23 +47,29 @@ jobs:
           path: .ran-today
           key: ran-${{ steps.date.outputs.d }}
 
-      - name: Already ran today
-        if: github.event_name == 'schedule' && steps.ran.outputs.cache-hit == 'true'
-        run: echo "Today's run already happened. Nothing to do."
+      - name: Decide whether to run
+        id: go
+        run: |
+          if [ "${{ steps.ran.outputs.cache-hit }}" = "true" ] && { [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.skip_if_done }}" = "true" ]; }; then
+            echo "Today's run already happened. Nothing to do."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/checkout@v4
-        if: github.event_name != 'schedule' || steps.ran.outputs.cache-hit != 'true'
+        if: steps.go.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
-        if: github.event_name != 'schedule' || steps.ran.outputs.cache-hit != 'true'
+        if: steps.go.outputs.run == 'true'
         with:
           python-version: "3.12"
 
       - run: pip install -r requirements.txt
-        if: github.event_name != 'schedule' || steps.ran.outputs.cache-hit != 'true'
+        if: steps.go.outputs.run == 'true'
 
       - name: Run bot
-        if: github.event_name != 'schedule' || steps.ran.outputs.cache-hit != 'true'
+        if: steps.go.outputs.run == 'true'
         env:
           ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
@@ -72,7 +82,7 @@ jobs:
       # Mark today as done only after a successful scheduled run. If the bot failed,
       # nothing is saved, so the next scheduled try runs it again.
       - name: Mark today as done
-        if: (github.event_name == 'schedule' || inputs.dry_run == false) && steps.ran.outputs.cache-hit != 'true'
+        if: (github.event_name == 'schedule' || inputs.dry_run == false) && steps.go.outputs.run == 'true' && steps.ran.outputs.cache-hit != 'true'
         run: echo "${{ steps.date.outputs.d }}" > .ran-today
 
       # Public repos have their schedules switched off after 60 days without activity.
