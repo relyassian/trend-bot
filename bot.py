@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+from pathlib import Path
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -385,6 +386,9 @@ def main() -> int:
             return 0
         res = rebalance(broker, cfg)
         notify(cfg, compose(res, cfg))
+        if not res.error and not cfg.dry_run:
+            # Tells the workflow today's run really happened (a closed-market run doesn't count).
+            Path(".ran-today").write_text(datetime.now(ET).date().isoformat())
         return 1 if res.error else 0
     except Exception as e:  # noqa: BLE001
         notify(cfg, f"❌ Something went wrong. Trying again next weekday.\n"

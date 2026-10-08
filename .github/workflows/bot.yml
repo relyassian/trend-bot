@@ -5,10 +5,8 @@ on:
     # GitHub often delays these by hours, so the main trigger is an outside daily check that
     # starts this workflow at 10:50am ET (backup 2:50pm). These timers are extra tries.
     # Only the first successful run each day does anything; the others see it already ran and stop.
-    - cron: "45 14 * * 1-5"
-    - cron: "15 16 * * 1-5"
-    - cron: "45 17 * * 1-5"
-    - cron: "15 19 * * 1-5"
+    - cron: "50 13-19 * * 1-5"
+    - cron: "20 14-19 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -37,8 +35,8 @@ jobs:
         id: date
         run: echo "d=$(TZ=America/New_York date +%F)" >> "$GITHUB_OUTPUT"
 
-      # Scheduled runs skip if today already ran. A real (non-dry) manual run always runs,
-      # and counts as today's run so the later scheduled tries don't repeat it.
+      # Scheduled runs skip if today already ran. bot.py writes .ran-today only after a real trade
+      # day finishes OK (not when the market is closed), and this step saves it at the end of the job.
       - name: Check if today's run already happened
         id: ran
         if: github.event_name == 'schedule' || inputs.dry_run == false
@@ -78,12 +76,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: python bot.py
-
-      # Mark today as done only after a successful scheduled run. If the bot failed,
-      # nothing is saved, so the next scheduled try runs it again.
-      - name: Mark today as done
-        if: (github.event_name == 'schedule' || inputs.dry_run == false) && steps.go.outputs.run == 'true' && steps.ran.outputs.cache-hit != 'true'
-        run: echo "${{ steps.date.outputs.d }}" > .ran-today
 
       # Public repos have their schedules switched off after 60 days without activity.
       # Re-enabling the workflow on every scheduled run resets that timer.
